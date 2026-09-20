@@ -1,0 +1,48 @@
+//@version=6
+indicator("EMA Triple Alignment (5/20/35, 1H)", overlay = true)
+
+// ---------------------------------------------------------------------------
+// Inputs
+// ---------------------------------------------------------------------------
+emaTimeframe   = input.timeframe("60", "EMA Timeframe")
+fastLen        = input.int(5,  "Fast EMA Length",  minval = 1)
+midLen         = input.int(20, "Mid EMA Length",   minval = 1)
+slowLen        = input.int(35, "Slow EMA Length",  minval = 1)
+requireStack   = input.bool(true, "Also require EMA5 > EMA20 > EMA35 (stacked/bullish order)")
+
+// ---------------------------------------------------------------------------
+// EMAs pulled from the 1-hour timeframe regardless of the chart's own timeframe.
+// lookahead=off avoids repainting by only using confirmed 1H bar values.
+// ---------------------------------------------------------------------------
+ema5  = request.security(syminfo.tickerid, emaTimeframe, ta.ema(close, fastLen), lookahead = barmerge.lookahead_off)
+ema20 = request.security(syminfo.tickerid, emaTimeframe, ta.ema(close, midLen),  lookahead = barmerge.lookahead_off)
+ema35 = request.security(syminfo.tickerid, emaTimeframe, ta.ema(close, slowLen), lookahead = barmerge.lookahead_off)
+
+// ---------------------------------------------------------------------------
+// Trigger condition: price above all three 1H EMAs (optionally also requiring
+// the EMAs themselves to be stacked fast > mid > slow for a cleaner uptrend).
+// ---------------------------------------------------------------------------
+priceAboveAll = close > ema5 and close > ema20 and close > ema35
+stackedBullish = ema5 > ema20 and ema20 > ema35
+triggered = requireStack ? (priceAboveAll and stackedBullish) : priceAboveAll
+
+// Fires only on the bar where the condition first becomes true.
+triggeredNow = triggered and not triggered[1]
+
+// ---------------------------------------------------------------------------
+// Plots
+// ---------------------------------------------------------------------------
+plot(ema5,  "EMA 5 (1H)",  color = color.new(color.aqua,   0), linewidth = 1)
+plot(ema20, "EMA 20 (1H)", color = color.new(color.orange, 0), linewidth = 1)
+plot(ema35, "EMA 35 (1H)", color = color.new(color.purple, 0), linewidth = 1)
+
+bgcolor(triggered ? color.new(color.green, 90) : na, title = "Above All EMAs")
+
+plotshape(triggeredNow, title = "Trigger", location = location.belowbar,
+     style = shape.triangleup, size = size.small, color = color.green)
+
+// ---------------------------------------------------------------------------
+// Alerts
+// ---------------------------------------------------------------------------
+alertcondition(triggeredNow, title = "Price Above 5/20/35 EMA (1H)",
+     message = "{{ticker}}: price crossed above the 5, 20, and 35 EMA on the 1H timeframe.")
