@@ -1,0 +1,336 @@
+//@version=6
+indicator("Level-to-Level Trigger System (0DTE Guide, Technical Only)", overlay = true, max_lines_count = 300, max_labels_count = 300)
+
+// =============================================================================
+// This script implements the price-action / technical triggers from the
+// "0DTE SPY/QQQ Trading Strategy Guide" (levels, EMA trend filters, timeframe
+// drill-down, level reaction, market breadth, VWAP reversion, session windows).
+// Everything option-specific (contract pricing, delta, OTM distance, IV,
+// theta, % gain/stop on premium) is intentionally NOT implemented here.
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// Inputs
+// ---------------------------------------------------------------------------
+grpGen = "General"
+useExtendedSession = input.bool(true, "Prior Day High/Low Includes Pre/Post Market", group = grpGen)
+sessionTZ          = input.string("America/Los_Angeles", "Session Timezone (guide times are PT)", group = grpGen)
+
+grpEma = "EMA Trend Filters"
+emaFast1  = input.int(5,  "Fast Cloud EMA 1", group = grpEma)
+emaFast2  = input.int(10, "Fast Cloud EMA 2", group = grpEma)
+emaMid    = input.int(20, "Primary Trend EMA", group = grpEma)
+emaSlow1  = input.int(35, "Slow Cloud EMA 1", group = grpEma)
+emaSlow2  = input.int(50, "Slow Cloud EMA 2", group = grpEma)
+biasTF    = input.timeframe("60", "1H Bias Timeframe (directional bias)", group = grpEma)
+alignTF   = input.timeframe("10", "10m Alignment Timeframe", group = grpEma)
+requireAlign = input.bool(true, "Require 10m Alignment With 1H Bias", group = grpEma)
+show1H    = input.bool(true,  "Plot 1H EMAs/Clouds", group = grpEma)
+show10m   = input.bool(false, "Plot 10m EMAs/Clouds", group = grpEma)
+
+grpLvl = "Levels"
+showPriorDay   = input.bool(true, "Show Prior Day High/Low/Open/Close", group = grpLvl)
+showPremarket  = input.bool(true, "Show Premarket High/Low", group = grpLvl)
+showOutliers   = input.bool(true, "Show 10-Day Outlier Levels (view on 1H chart)", group = grpLvl)
+outlierDays    = input.int(10, "Outlier Lookback (days)", group = grpLvl)
+pivotLeft      = input.int(3, "Outlier Pivot Left Bars", group = grpLvl)
+pivotRight     = input.int(3, "Outlier Pivot Right Bars", group = grpLvl)
+maxOutliers    = input.int(8, "Max Outlier Levels Tracked (per side)", group = grpLvl)
+levelProximity = input.float(0.50, "Level Proximity (\"at a level\")", step = 0.05, group = grpLvl)
+
+grpCascade = "Setup Cascade (5m Setup Bar -> Entry Trigger)"
+setupTF          = input.timeframe("5", "Setup Bar Timeframe", group = grpCascade)
+requireLevelForSetup = input.bool(true, "Require Price At/Rejecting/Stalling a Level for Setup", group = grpCascade)
+
+grpVwap = "VWAP Reversion (Late-Day)"
+useVwapReversion = input.bool(true, "Enable VWAP Reversion Trigger", group = grpVwap)
+vwapWinStart     = input.string("1220", "VWAP Reversion Window Start (HHMM, PT)", group = grpVwap)
+vwapWinEnd       = input.string("1230", "VWAP Reversion Window End (HHMM, PT)", group = grpVwap)
+vwapBandLen      = input.int(20, "VWAP Band Deviation Length", group = grpVwap)
+vwapBandMult     = input.float(2.0, "VWAP Band Multiplier", group = grpVwap)
+
+grpBreadth = "Market Breadth (optional)"
+breadthSymHighs = input.string("", "New Highs Symbol (blank = skip breadth filter)", group = grpBreadth)
+breadthSymLows  = input.string("", "New Lows Symbol (blank = skip breadth filter)", group = grpBreadth)
+
+grpSession = "Session Windows (PT)"
+avoidWinStart = input.string("0630", "Avoid Window Start (HHMM)", group = grpSession)
+avoidWinEnd   = input.string("0800", "Avoid Window End (HHMM)", group = grpSession)
+blockDuringAvoid = input.bool(true, "Block Triggers During Avoid Window", group = grpSession)
+
+grpUi = "Display"
+showTable = input.bool(true, "Show Status Table", group = grpUi)
+
+// ---------------------------------------------------------------------------
+// EMA trend-filter fetch (per guide: 1H bias + 10m alignment, both must
+// agree: price above 20 EMA AND above both EMA clouds for bullish bias)
+// ---------------------------------------------------------------------------
+f_emaSet(tf) =>
+    e1  = request.security(syminfo.tickerid, tf, ta.ema(close, emaFast1), lookahead = barmerge.lookahead_off)
+    e2  = request.security(syminfo.tickerid, tf, ta.ema(close, emaFast2), lookahead = barmerge.lookahead_off)
+    e20 = request.security(syminfo.tickerid, tf, ta.ema(close, emaMid),   lookahead = barmerge.lookahead_off)
+    e35 = request.security(syminfo.tickerid, tf, ta.ema(close, emaSlow1), lookahead = barmerge.lookahead_off)
+    e50 = request.security(syminfo.tickerid, tf, ta.ema(close, emaSlow2), lookahead = barmerge.lookahead_off)
+    px  = request.security(syminfo.tickerid, tf, close, lookahead = barmerge.lookahead_off)
+    [e1, e2, e20, e35, e50, px]
+
+[f5, f10, f20, f35, f50, fpx]     = f_emaSet(biasTF)
+[m5, m10, m20, m35, m50, mpx]     = f_emaSet(alignTF)
+
+bias1H_bull = fpx > f20 and fpx > math.max(f5, f10) and fpx > math.max(f35, f50)
+bias1H_bear = fpx < f20 and fpx < math.min(f5, f10) and fpx < math.min(f35, f50)
+
+align_bull = mpx > m20 and mpx > math.max(m5, m10) and mpx > math.max(m35, m50)
+align_bear = mpx < m20 and mpx < math.min(m5, m10) and mpx < math.min(m35, m50)
+
+biasBull = bias1H_bull and (not requireAlign or align_bull)
+biasBear = bias1H_bear and (not requireAlign or align_bear)
+
+// ---------------------------------------------------------------------------
+// Levels: prior day H/L/O/C, premarket H/L, 10-day outlier pivots
+// ---------------------------------------------------------------------------
+extTicker = ticker.new(syminfo.prefix, syminfo.ticker, session.extended)
+dailyTicker = useExtendedSession ? extTicker : syminfo.tickerid
+[pdHigh, pdLow, pdOpen, pdClose] = request.security(dailyTicker, "D", [high[1], low[1], open[1], close[1]], lookahead = barmerge.lookahead_off)
+
+var float preHigh = na
+var float preLow  = na
+newDay = ta.change(time("D", sessionTZ))
+if newDay
+    preHigh := na
+    preLow  := na
+inPreMarket = not na(time(timeframe.period, "0000-0630", sessionTZ))
+if inPreMarket
+    preHigh := na(preHigh) ? high : math.max(preHigh, high)
+    preLow  := na(preLow)  ? low  : math.min(preLow, low)
+
+// 10-day outlier pivots (bars that spiked and reversed) - intended for the 1H chart
+var line[]  outHighLines = array.new_line()
+var float[] outHighVals  = array.new_float()
+var line[]  outLowLines  = array.new_line()
+var float[] outLowVals   = array.new_float()
+
+ph = ta.pivothigh(pivotLeft, pivotRight)
+pl = ta.pivotlow(pivotLeft, pivotRight)
+lookbackMs = outlierDays * 86400000
+
+if showOutliers and not na(ph) and (timenow - time[pivotRight]) <= lookbackMs
+    ln = line.new(bar_index[pivotRight], ph, bar_index, ph, extend = extend.right, color = color.new(color.red, 30), style = line.style_dashed)
+    array.push(outHighLines, ln)
+    array.push(outHighVals, ph)
+    if array.size(outHighLines) > maxOutliers
+        line.delete(array.shift(outHighLines))
+        array.shift(outHighVals)
+
+if showOutliers and not na(pl) and (timenow - time[pivotRight]) <= lookbackMs
+    ln = line.new(bar_index[pivotRight], pl, bar_index, pl, extend = extend.right, color = color.new(color.lime, 30), style = line.style_dashed)
+    array.push(outLowLines, ln)
+    array.push(outLowVals, pl)
+    if array.size(outLowLines) > maxOutliers
+        line.delete(array.shift(outLowLines))
+        array.shift(outLowVals)
+
+// Combine active levels for proximity/nearest-level checks
+levelsNow = array.new_float()
+if showPriorDay
+    array.push(levelsNow, pdHigh)
+    array.push(levelsNow, pdLow)
+    array.push(levelsNow, pdOpen)
+    array.push(levelsNow, pdClose)
+if showPremarket and not na(preHigh)
+    array.push(levelsNow, preHigh)
+    array.push(levelsNow, preLow)
+if showOutliers and array.size(outHighVals) > 0
+    for i = 0 to array.size(outHighVals) - 1
+        array.push(levelsNow, array.get(outHighVals, i))
+if showOutliers and array.size(outLowVals) > 0
+    for i = 0 to array.size(outLowVals) - 1
+        array.push(levelsNow, array.get(outLowVals, i))
+
+nearestLevelValue = float(na)
+minDist = 1e10
+if array.size(levelsNow) > 0
+    for i = 0 to array.size(levelsNow) - 1
+        lv = array.get(levelsNow, i)
+        d = math.abs(close - lv)
+        if d < minDist
+            minDist := d
+            nearestLevelValue := lv
+nearLevel = not na(nearestLevelValue) and minDist <= levelProximity
+
+// ---------------------------------------------------------------------------
+// Level reaction: rejection / stall / breakout (simplified heuristic)
+// ---------------------------------------------------------------------------
+var float trackedLevel   = na
+var int   barsSinceTouch = 0
+var string reaction      = "-"
+
+if nearLevel
+    if na(trackedLevel) or math.abs(trackedLevel - nearestLevelValue) > levelProximity * 2
+        trackedLevel := nearestLevelValue
+        barsSinceTouch := 0
+    else
+        barsSinceTouch += 1
+else
+    trackedLevel := na
+    barsSinceTouch := 0
+
+minutesPerBar = timeframe.in_seconds(timeframe.period) / 60.0
+stallBars = math.max(1, math.round(20.0 / math.max(minutesPerBar, 1.0)))
+
+breakoutUp   = not na(trackedLevel) and close > trackedLevel + levelProximity and close > open
+breakoutDown = not na(trackedLevel) and close < trackedLevel - levelProximity and close < open
+
+if breakoutUp
+    reaction := "BREAKOUT UP"
+else if breakoutDown
+    reaction := "BREAKOUT DOWN"
+else if nearLevel and barsSinceTouch >= stallBars
+    reaction := "STALL"
+else if nearLevel
+    reaction := "TESTING"
+else
+    reaction := "-"
+
+levelSignal = not requireLevelForSetup or nearLevel or reaction == "STALL"
+
+// ---------------------------------------------------------------------------
+// Market breadth (optional confirmation)
+// ---------------------------------------------------------------------------
+breadthEnabled = str.length(breadthSymHighs) > 0 and str.length(breadthSymLows) > 0
+symHighs = breadthEnabled ? breadthSymHighs : syminfo.tickerid
+symLows  = breadthEnabled ? breadthSymLows  : syminfo.tickerid
+newHighsVal = request.security(symHighs, timeframe.period, close, lookahead = barmerge.lookahead_off)
+newLowsVal  = request.security(symLows,  timeframe.period, close, lookahead = barmerge.lookahead_off)
+breadthBullish = not breadthEnabled or newHighsVal > newLowsVal
+breadthBearish = not breadthEnabled or newLowsVal > newHighsVal
+
+// ---------------------------------------------------------------------------
+// Session windows (PT)
+// ---------------------------------------------------------------------------
+avoidWindow = not na(time(timeframe.period, avoidWinStart + "-" + avoidWinEnd, sessionTZ))
+vwapWindow  = not na(time(timeframe.period, vwapWinStart + "-" + vwapWinEnd, sessionTZ))
+blocked = blockDuringAvoid and avoidWindow
+
+// ---------------------------------------------------------------------------
+// Timeframe drill-down: 5m setup bar (pullback + higher-high/lower-low)
+// then entry trigger on the chart's own timeframe (intended: 2m)
+// ---------------------------------------------------------------------------
+[s5h, s5h1, s5l, s5l1] = request.security(syminfo.tickerid, setupTF, [high, high[1], low, low[1]], lookahead = barmerge.lookahead_off)
+
+setupBarCall = biasBull and levelSignal and s5h > s5h1
+setupBarPut  = biasBear and levelSignal and s5l < s5l1
+
+var float setupHighLevel = na
+var float setupLowStop   = na
+var float setupLowLevel  = na
+var float setupHighStop  = na
+
+if setupBarCall
+    setupHighLevel := s5h
+    setupLowStop   := s5l1
+if setupBarPut
+    setupLowLevel  := s5l
+    setupHighStop  := s5h1
+
+callEntryTrigger = not blocked and not na(setupHighLevel) and ta.crossover(close, setupHighLevel) and biasBull and breadthBullish
+putEntryTrigger  = not blocked and not na(setupLowLevel)  and ta.crossunder(close, setupLowLevel)  and biasBear and breadthBearish
+
+if callEntryTrigger
+    setupHighLevel := na
+if putEntryTrigger
+    setupLowLevel := na
+
+// ---------------------------------------------------------------------------
+// VWAP reversion (late-day, after 12:00 PM PT window)
+// ---------------------------------------------------------------------------
+vwapVal = ta.vwap(hlc3)
+vwapDev = ta.stdev(hlc3 - vwapVal, vwapBandLen)
+vwapUpper = vwapVal + vwapDev * vwapBandMult
+vwapLower = vwapVal - vwapDev * vwapBandMult
+
+vwapReversionCall = not blocked and useVwapReversion and vwapWindow and close < vwapVal and breadthBullish and ta.crossover(close, high[1])
+vwapReversionPut  = not blocked and useVwapReversion and vwapWindow and close > vwapVal and breadthBearish and ta.crossunder(close, low[1])
+
+// ---------------------------------------------------------------------------
+// Plots: levels
+// ---------------------------------------------------------------------------
+plot(showPriorDay ? pdHigh  : na, "Prior Day High",  color = color.new(color.gray, 0),  style = plot.style_circles)
+plot(showPriorDay ? pdLow   : na, "Prior Day Low",   color = color.new(color.gray, 0),  style = plot.style_circles)
+plot(showPriorDay ? pdOpen  : na, "Prior Day Open",  color = color.new(color.gray, 60), style = plot.style_circles)
+plot(showPriorDay ? pdClose : na, "Prior Day Close", color = color.new(color.gray, 60), style = plot.style_circles)
+plot(showPremarket ? preHigh : na, "Premarket High", color = color.new(color.fuchsia, 0), style = plot.style_circles)
+plot(showPremarket ? preLow  : na, "Premarket Low",  color = color.new(color.fuchsia, 0), style = plot.style_circles)
+
+// ---------------------------------------------------------------------------
+// Plots: EMAs / clouds
+// ---------------------------------------------------------------------------
+p1H_5  = plot(show1H ? f5  : na, "1H EMA5",  color = color.new(color.orange, 40))
+p1H_10 = plot(show1H ? f10 : na, "1H EMA10", color = color.new(color.orange, 40))
+fill(p1H_5, p1H_10, color = color.new(color.orange, 85), title = "1H 5/10 Cloud")
+
+p1H_35 = plot(show1H ? f35 : na, "1H EMA35", color = color.new(color.blue, 40))
+p1H_50 = plot(show1H ? f50 : na, "1H EMA50", color = color.new(color.blue, 40))
+fill(p1H_35, p1H_50, color = color.new(color.blue, 85), title = "1H 35/50 Cloud")
+
+plot(show1H ? f20 : na, "1H EMA20 (Trend Filter)", color = color.new(color.yellow, 0), linewidth = 2)
+
+p10_5  = plot(show10m ? m5  : na, "10m EMA5",  color = color.new(color.orange, 60), style = plot.style_stepline)
+p10_10 = plot(show10m ? m10 : na, "10m EMA10", color = color.new(color.orange, 60), style = plot.style_stepline)
+fill(p10_5, p10_10, color = color.new(color.orange, 92), title = "10m 5/10 Cloud")
+
+p10_35 = plot(show10m ? m35 : na, "10m EMA35", color = color.new(color.blue, 60), style = plot.style_stepline)
+p10_50 = plot(show10m ? m50 : na, "10m EMA50", color = color.new(color.blue, 60), style = plot.style_stepline)
+fill(p10_35, p10_50, color = color.new(color.blue, 92), title = "10m 35/50 Cloud")
+
+plot(show10m ? m20 : na, "10m EMA20", color = color.new(color.yellow, 40), style = plot.style_stepline)
+
+plot(vwapVal, "VWAP", color = color.new(color.aqua, 0), linewidth = 2)
+plot(vwapUpper, "VWAP Upper Band", color = color.new(color.aqua, 70))
+plot(vwapLower, "VWAP Lower Band", color = color.new(color.aqua, 70))
+
+// ---------------------------------------------------------------------------
+// Background bias tint
+// ---------------------------------------------------------------------------
+bgcolor(biasBull ? color.new(color.green, 92) : biasBear ? color.new(color.red, 92) : na, title = "Bias Tint")
+
+// ---------------------------------------------------------------------------
+// Entry trigger markers
+// ---------------------------------------------------------------------------
+plotshape(callEntryTrigger, title = "Call Entry Trigger", style = shape.triangleup, location = location.belowbar, color = color.green, size = size.small)
+plotshape(putEntryTrigger,  title = "Put Entry Trigger",  style = shape.triangledown, location = location.abovebar, color = color.red, size = size.small)
+plotshape(vwapReversionCall, title = "VWAP Reversion Call", style = shape.circle, location = location.belowbar, color = color.teal, size = size.tiny)
+plotshape(vwapReversionPut,  title = "VWAP Reversion Put",  style = shape.circle, location = location.abovebar, color = color.maroon, size = size.tiny)
+
+// ---------------------------------------------------------------------------
+// Alerts
+// ---------------------------------------------------------------------------
+alertcondition(callEntryTrigger, "Call Entry Trigger", "{{ticker}}: Level-to-level CALL trigger - bullish bias, breadth confirmed, price closed above 5m setup high.")
+alertcondition(putEntryTrigger,  "Put Entry Trigger",  "{{ticker}}: Level-to-level PUT trigger - bearish bias, breadth confirmed, price closed below 5m setup low.")
+alertcondition(vwapReversionCall, "VWAP Reversion Call", "{{ticker}}: Late-day VWAP reversion CALL setup (below VWAP, momentum turning up).")
+alertcondition(vwapReversionPut,  "VWAP Reversion Put",  "{{ticker}}: Late-day VWAP reversion PUT setup (above VWAP, momentum turning down).")
+
+// ---------------------------------------------------------------------------
+// Status table
+// ---------------------------------------------------------------------------
+if showTable
+    var table t = table.new(position.top_right, 2, 9, border_width = 1)
+    table.cell(t, 0, 0, "Bias",      bgcolor = color.gray, text_color = color.white)
+    table.cell(t, 1, 0, biasBull ? "BULLISH" : biasBear ? "BEARISH" : "NONE", bgcolor = biasBull ? color.green : biasBear ? color.red : color.gray, text_color = color.white)
+    table.cell(t, 0, 1, "Near Level", bgcolor = color.gray, text_color = color.white)
+    table.cell(t, 1, 1, nearLevel ? str.tostring(nearestLevelValue, format.mintick) : "-", text_color = color.black)
+    table.cell(t, 0, 2, "Reaction", bgcolor = color.gray, text_color = color.white)
+    table.cell(t, 1, 2, reaction, text_color = color.black)
+    table.cell(t, 0, 3, "Setup Armed", bgcolor = color.gray, text_color = color.white)
+    table.cell(t, 1, 3, (not na(setupHighLevel) ? "CALL @ " + str.tostring(setupHighLevel, format.mintick) + " " : "") + (not na(setupLowLevel) ? "PUT @ " + str.tostring(setupLowLevel, format.mintick) : (na(setupHighLevel) ? "-" : "")), text_color = color.black)
+    table.cell(t, 0, 4, "Breadth", bgcolor = color.gray, text_color = color.white)
+    table.cell(t, 1, 4, breadthEnabled ? (breadthBullish ? "BULLISH" : breadthBearish ? "BEARISH" : "MIXED") : "OFF", text_color = color.black)
+    table.cell(t, 0, 5, "Avoid Window", bgcolor = color.gray, text_color = color.white)
+    table.cell(t, 1, 5, avoidWindow ? "YES (blocked)" : "no", text_color = color.black)
+    table.cell(t, 0, 6, "VWAP Window", bgcolor = color.gray, text_color = color.white)
+    table.cell(t, 1, 6, vwapWindow ? "ACTIVE" : "no", text_color = color.black)
+    table.cell(t, 0, 7, "10m Aligned", bgcolor = color.gray, text_color = color.white)
+    table.cell(t, 1, 7, requireAlign ? (align_bull ? "BULL" : align_bear ? "BEAR" : "no") : "n/a", text_color = color.black)
+    stopText = (not na(setupLowStop) ? "Call " + str.tostring(setupLowStop, format.mintick) + " " : "") + (not na(setupHighStop) ? "Put " + str.tostring(setupHighStop, format.mintick) : "")
+    table.cell(t, 0, 8, "Stop Ref (setup bar)", bgcolor = color.gray, text_color = color.white)
+    table.cell(t, 1, 8, stopText == "" ? "-" : stopText, text_color = color.black)
