@@ -26,7 +26,9 @@ pivLeft    = input.int(6, "Pivot left bars (1H)", minval = 1, group = grpLvl)
 pivRight   = input.int(6, "Pivot right bars (1H)", minval = 1, group = grpLvl)
 lookDays   = input.int(10, "Pivot lookback (trading days)", minval = 1, maxval = 30, group = grpLvl)
 mergePct   = input.float(0.05, "Skip pivots within % of an existing level", minval = 0, step = 0.01, group = grpLvl) / 100
-lvlColor   = input.color(color.yellow, "Level color", group = grpLvl)
+pdColor    = input.color(color.rgb(135, 206, 250), "Prior-day level color", group = grpLvl)
+pmColor    = input.color(color.yellow, "Pre-market level color", group = grpLvl)
+pivColor   = input.color(color.purple, "Pivot level color", group = grpLvl)
 showLabels = input.bool(true, "Show level labels", group = grpLvl)
 
 grpInd = "Indicators"
@@ -39,7 +41,6 @@ bandMult2 = input.float(2.0, "VWAP band #2 (stdev)", step = 0.5, group = grpInd)
 grpTr = "Triggers"
 nearPct   = input.float(0.10, "Proximity to a critical level (%)", minval = 0, step = 0.01, group = grpTr) / 100
 resetPct  = input.float(0.15, "Reset distance beyond the level (%)", minval = 0, step = 0.01, group = grpTr) / 100
-holdMode  = input.string("Wicks", "'Stay above/below for a 5m bar' test uses", options = ["Wicks", "Closes"], group = grpTr)
 expiryMin = input.int(60, "Setup expiry (minutes, 0 = never)", minval = 0, group = grpTr)
 rthOnly   = input.bool(true, "Signals only during regular session", group = grpTr)
 enMomUp   = input.bool(true, "Positive momentum trigger", group = grpTr)
@@ -51,7 +52,6 @@ if not timeframe.isintraday
     runtime.error("Use an intraday chart. Triggers require a 1-minute chart.")
 
 bool trigTf   = timeframe.isminutes and timeframe.multiplier == 1
-bool useWicks = holdMode == "Wicks"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -63,8 +63,6 @@ type Bucket
     float h
     float l
     float c
-    float minC
-    float maxC
     bool  closed = false
 
 // Per-level state for one trigger.
@@ -73,7 +71,6 @@ type Trig
     float ref
     int   t0
     int   stepBar
-    int   crossTime
 
 type Level
     float  price
@@ -93,7 +90,6 @@ method reset(Trig this) =>
     this.ref       := na
     this.t0        := na
     this.stepBar   := na
-    this.crossTime := na
 
 method expired(Trig this) =>
     expiryMin > 0 and not na(this.t0) and time - this.t0 > expiryMin * 60000
@@ -165,9 +161,9 @@ bool pivChanged = nz(ht0) != nz(ht0[1]) or nz(lt0) != nz(lt0[1]) or nz(pivCut) !
 // ---------------------------------------------------------------------------
 var array<Level> levels = array.new<Level>()
 
-newLevel(float p, string kind, int t, int width, string style, bool daily) =>
-    line ln = line.new(t, p, t + 60000, p, xloc = xloc.bar_time, extend = extend.right, color = lvlColor, style = style, width = width)
-    label lb = showLabels ? label.new(bar_index, p, kind + " " + str.tostring(p, format.mintick), style = label.style_label_left, color = color(na), textcolor = lvlColor, size = size.small) : na
+newLevel(float p, string kind, int t, int width, string style, color col, bool daily) =>
+    line ln = line.new(t, p, t + 60000, p, xloc = xloc.bar_time, extend = extend.right, color = col, style = style, width = width)
+    label lb = showLabels ? label.new(bar_index, p, kind + " " + str.tostring(p, format.mintick), style = label.style_label_left, color = color(na), textcolor = col, size = size.small) : na
     Level.new(price = p, kind = kind, t = t, ln = ln, lb = lb, daily = daily, seen = true, mu = Trig.new(), md = Trig.new(), ru = Trig.new(), rd = Trig.new())
 
 method setPrice(Level this, float p) =>
@@ -212,22 +208,20 @@ updBucket(Bucket b, int periodMs) =>
         b.h      := high
         b.l      := low
         b.c      := close
-        b.minC   := close
-        b.maxC   := close
         b.closed := false
     else
         b.h    := math.max(b.h, high)
         b.l    := math.min(b.l, low)
         b.c    := close
-        b.minC := math.min(b.minC, close)
-        b.maxC := math.max(b.maxC, close)
     if time_close % periodMs == 0
         b.closed := true
         done     := b.copy()
     done
 
-holdAbove(Bucket b, float lvl) => useWicks ? b.l > lvl : b.minC > lvl
-holdBelow(Bucket b, float lvl) => useWicks ? b.h < lvl : b.maxC < lvl
+// Green 5m bar that does not drop more than nearPct below the level and closes above it.
+greenHold(Bucket b, float lvl) => b.c > b.o and b.l >= lvl * (1 - nearPct) and b.c > lvl
+// Red 5m bar that does not rise more than nearPct above the level and closes below it.
+redHold(Bucket b, float lvl) => b.c < b.o and b.h <= lvl * (1 + nearPct) and b.c < lvl
 
 // ---------------------------------------------------------------------------
 // Daily tracking: prior-day H/L/O/C and today's pre-market H/L
@@ -259,10 +253,10 @@ if barstate.isconfirmed
         pmLoLv := na
         if not na(rOpen) and not na(dHi)
             int t = time
-            levels.push(newLevel(dHi,    "PDH", t, 2, line.style_solid, true))
-            levels.push(newLevel(dLo,    "PDL", t, 2, line.style_solid, true))
-            levels.push(newLevel(rOpen,  "PDO", t, 2, line.style_solid, true))
-            levels.push(newLevel(rClose, "PDC", t, 2, line.style_solid, true))
+            levels.push(newLevel(dHi,    "PDH", t, 1, line.style_solid, pdColor, true))
+            levels.push(newLevel(dLo,    "PDL", t, 1, line.style_solid, pdColor, true))
+            levels.push(newLevel(rOpen,  "PDO", t, 1, line.style_solid, pdColor, true))
+            levels.push(newLevel(rClose, "PDC", t, 1, line.style_solid, pdColor, true))
         for lv in levels
             lv.mu.reset()
             lv.md.reset()
@@ -286,8 +280,8 @@ if barstate.isconfirmed
     if session.ispremarket
         sawPremarket := true
         if na(pmHiLv)
-            pmHiLv := newLevel(high, "PMH", time, 1, line.style_solid, true)
-            pmLoLv := newLevel(low,  "PML", time, 1, line.style_solid, true)
+            pmHiLv := newLevel(high, "PMH", time, 1, line.style_solid, pmColor, true)
+            pmLoLv := newLevel(low,  "PML", time, 1, line.style_solid, pmColor, true)
             levels.push(pmHiLv)
             levels.push(pmLoLv)
         else
@@ -317,7 +311,7 @@ if barstate.isconfirmed
             if not na(found)
                 found.seen := true
             else if not nearExisting(v)
-                levels.push(newLevel(v, k, t, 2, line.style_dashed, false))
+                levels.push(newLevel(v, k, t, 1, line.style_dashed, pivColor, false))
         purge(false)
 
     // --- Triggers ------------------------------------------------------------
@@ -345,16 +339,13 @@ if barstate.isconfirmed
                     s.t0   := time
                 // 2. Price passes through the level to the upside.
                 if s.step == 1 and pc <= L and close > L
-                    s.step      := 2
-                    s.crossTime := time_close
-                // 3. Stays above the level for an entire 5-minute bar.
-                if s.step == 2
-                    if close <= L
-                        s.step := 1
-                    else if not na(c5) and c5.t >= s.crossTime and holdAbove(c5, L)
-                        s.step    := 3
-                        s.ref     := c5.h
-                        s.stepBar := bar_index
+                    s.step := 2
+                // 3. Green 5m bar (may be the one containing the cross) that stays within
+                //    nearPct of the level on the wrong side and closes above it.
+                if s.step == 2 and not na(c5) and greenHold(c5, L)
+                    s.step    := 3
+                    s.ref     := c5.h
+                    s.stepBar := bar_index
                 // 4. A 2-minute bar closes above that 5-minute bar's high.
                 if s.step == 3 and not na(c2) and bar_index > s.stepBar and c2.c > s.ref and sessOk
                     sigMU := true
@@ -372,16 +363,13 @@ if barstate.isconfirmed
                     s.t0   := time
                 // 2. Price passes through the level to the downside.
                 if s.step == 1 and pc >= L and close < L
-                    s.step      := 2
-                    s.crossTime := time_close
-                // 3. Stays below the level for an entire 5-minute bar.
-                if s.step == 2
-                    if close >= L
-                        s.step := 1
-                    else if not na(c5) and c5.t >= s.crossTime and holdBelow(c5, L)
-                        s.step    := 3
-                        s.ref     := c5.l
-                        s.stepBar := bar_index
+                    s.step := 2
+                // 3. Red 5m bar (may be the one containing the cross) that stays within
+                //    nearPct of the level on the wrong side and closes below it.
+                if s.step == 2 and not na(c5) and redHold(c5, L)
+                    s.step    := 3
+                    s.ref     := c5.l
+                    s.stepBar := bar_index
                 // 4. A 2-minute bar closes below that 5-minute bar's low.
                 if s.step == 3 and not na(c2) and bar_index > s.stepBar and c2.c < s.ref and sessOk
                     sigMD := true
@@ -401,8 +389,8 @@ if barstate.isconfirmed
                         s.t0      := time
                         s.stepBar := bar_index
                     else if s.step == 1
-                        // 2. Green 5m bar that stays entirely above the level.
-                        if c5.c > c5.o and holdAbove(c5, L)
+                        // 2. Green 5m bar that does not drop nearPct below the level and closes above it.
+                        if greenHold(c5, L)
                             s.step    := 2
                             s.ref     := c5.h
                             s.stepBar := bar_index
@@ -428,8 +416,8 @@ if barstate.isconfirmed
                         s.t0      := time
                         s.stepBar := bar_index
                     else if s.step == 1
-                        // 2. Red 5m bar that stays entirely below the level.
-                        if c5.c < c5.o and holdBelow(c5, L)
+                        // 2. Red 5m bar that does not rise nearPct above the level and closes below it.
+                        if redHold(c5, L)
                             s.step    := 2
                             s.ref     := c5.l
                             s.stepBar := bar_index
