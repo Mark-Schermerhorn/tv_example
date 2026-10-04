@@ -11,10 +11,15 @@ indicator("SPY/QQQ Critical Level Triggers", shorttitle = "Crit Lvl Triggers", o
 //       Momentum up   (green triangle up)     Momentum down  (red triangle down)
 //       Reversion up  (green arrow up)        Reversion down (red arrow down)
 //
-// Triggers are built from 1-minute bars, so they only run on a 1-minute chart.
-// 5-minute and 2-minute bars are aggregated from the 1-minute bars. Enable
-// extended hours on the chart so pre-market levels can be collected.
-// All trigger logic runs on confirmed (closed) bars only, so it does not repaint.
+// Triggers are always evaluated on 1-minute bars, so the result is the same on
+// any chart from 1 to 15 minutes. On charts above 1 minute the 1-minute bars
+// are requested with request.security_lower_tf() and replayed inside each
+// chart bar; a trigger is marked on the chart bar that contains it. 5-minute
+// and 2-minute bars are aggregated from the 1-minute bars. Enable extended
+// hours on the chart so pre-market levels can be collected.
+// All trigger logic runs on confirmed (closed) chart bars only, so it does not
+// repaint. On a higher-timeframe chart a realtime trigger therefore appears
+// when the chart bar closes.
 // =============================================================================
 
 // ---------------------------------------------------------------------------
@@ -49,9 +54,9 @@ enRevUp   = input.bool(true, "Positive reversion trigger", group = grpTr)
 enRevDn   = input.bool(true, "Negative reversion trigger", group = grpTr)
 
 if not timeframe.isintraday
-    runtime.error("Use an intraday chart. Triggers require a 1-minute chart.")
+    runtime.error("Use an intraday chart. Triggers require a 1- to 15-minute chart.")
 
-bool trigTf   = timeframe.isminutes and timeframe.multiplier == 1
+bool trigTf = timeframe.isminutes and timeframe.multiplier <= 15
 
 // ---------------------------------------------------------------------------
 // Types
@@ -91,25 +96,40 @@ method reset(Trig this) =>
     this.t0        := na
     this.stepBar   := na
 
-method expired(Trig this) =>
-    expiryMin > 0 and not na(this.t0) and time - this.t0 > expiryMin * 60000
+method expired(Trig this, int now) =>
+    expiryMin > 0 and not na(this.t0) and now - this.t0 > expiryMin * 60000
 
 // ---------------------------------------------------------------------------
 // 1H EMAs (live, non-repainting): last confirmed 1H EMA advanced by the
 // current price, which equals the value the 1H chart shows intrabar.
 // ---------------------------------------------------------------------------
-htfEma(simple int len) =>
-    float prev = request.security(syminfo.tickerid, "60", ta.ema(close, len)[1], lookahead = barmerge.lookahead_on)
-    na(prev) ? na : prev + 2.0 / (len + 1) * (close - prev)
+htfPrevEma(simple int len) =>
+    request.security(syminfo.tickerid, "60", ta.ema(close, len)[1], lookahead = barmerge.lookahead_on)
 
-float ema5  = htfEma(5)
-float ema10 = htfEma(10)
-float ema20 = htfEma(20)
-float ema35 = htfEma(35)
-float ema50 = htfEma(50)
+liveEma(float prev, int len, float c) =>
+    na(prev) ? na : prev + 2.0 / (len + 1) * (c - prev)
 
-bool bullTrend = close > ema20 and close > math.max(ema5, ema10)
-bool bearTrend = close < ema20 and close < math.min(ema5, ema10)
+float pe5  = htfPrevEma(5)
+float pe10 = htfPrevEma(10)
+float pe20 = htfPrevEma(20)
+float pe35 = htfPrevEma(35)
+float pe50 = htfPrevEma(50)
+
+float ema5  = liveEma(pe5,  5,  close)
+float ema10 = liveEma(pe10, 10, close)
+float ema20 = liveEma(pe20, 20, close)
+float ema35 = liveEma(pe35, 35, close)
+float ema50 = liveEma(pe50, 50, close)
+
+// Trend filters evaluated at price `c` (a 1-minute close inside the chart bar).
+isBull(float c) => c > liveEma(pe20, 20, c) and c > math.max(liveEma(pe5, 5, c), liveEma(pe10, 10, c))
+isBear(float c) => c < liveEma(pe20, 20, c) and c < math.min(liveEma(pe5, 5, c), liveEma(pe10, 10, c))
+
+// ---------------------------------------------------------------------------
+// 1-minute bars inside each chart bar (a single element on a 1-minute chart).
+// ---------------------------------------------------------------------------
+string ltfTf = trigTf ? "1" : timeframe.period
+[mT, mTC, mO, mH, mL, mC, mMkt] = request.security_lower_tf(syminfo.tickerid, ltfTf, [time, time_close, open, high, low, close, session.ismarket ? 1 : 0])
 
 // ---------------------------------------------------------------------------
 // VWAP with bands (anchored to each trading day)
@@ -194,26 +214,26 @@ nearExisting(float p) =>
             break
     found
 
-// Aggregates chart bars into a bucket of `periodMs`. Returns a copy of the
-// bucket on the bar where it completes, otherwise na.
-updBucket(Bucket b, int periodMs) =>
+// Aggregates 1-minute bars into a bucket of `periodMs`. Returns a copy of the
+// bucket on the 1-minute bar where it completes, otherwise na.
+updBucket(Bucket b, int periodMs, int t, int tc, float o, float h, float l, float c) =>
     Bucket done = na
-    int start = time - time % periodMs
+    int start = t - t % periodMs
     if na(b.t) or start != b.t
         // Previous bucket ended without a boundary bar (data gap): complete it now.
         if not na(b.t) and not b.closed
             done := b.copy()
         b.t      := start
-        b.o      := open
-        b.h      := high
-        b.l      := low
-        b.c      := close
+        b.o      := o
+        b.h      := h
+        b.l      := l
+        b.c      := c
         b.closed := false
     else
-        b.h    := math.max(b.h, high)
-        b.l    := math.min(b.l, low)
-        b.c    := close
-    if time_close % periodMs == 0
+        b.h    := math.max(b.h, h)
+        b.l    := math.min(b.l, l)
+        b.c    := c
+    if tc % periodMs == 0
         b.closed := true
         done     := b.copy()
     done
@@ -237,7 +257,8 @@ var bool  sawPremarket = false
 var Bucket b5 = Bucket.new()
 var Bucket b2 = Bucket.new()
 
-float pc = close[1]
+var int   ib     = 0    // running count of processed 1-minute bars
+var float lastC  = na   // previous 1-minute close
 
 bool sigMU = false
 bool sigMD = false
@@ -316,119 +337,135 @@ if barstate.isconfirmed
 
     // --- Triggers ------------------------------------------------------------
     if trigTf
-        Bucket c5 = updBucket(b5, 300000)
-        Bucket c2 = updBucket(b2, 120000)
-        bool sessOk = not rthOnly or session.ismarket
+        int nIntra = mC.size()
+        // `for j = 0 to -1` would run once, so skip empty chart bars explicitly.
+        for j = 0 to nIntra - 1
+            if nIntra == 0
+                break
+            int   iT  = mT.get(j)
+            int   iTC = mTC.get(j)
+            float iO  = mO.get(j)
+            float iH  = mH.get(j)
+            float iL  = mL.get(j)
+            float iC  = mC.get(j)
+            float iPC = lastC
+            lastC  := iC
+            ib     += 1
+            Bucket c5 = updBucket(b5, 300000, iT, iTC, iO, iH, iL, iC)
+            Bucket c2 = updBucket(b2, 120000, iT, iTC, iO, iH, iL, iC)
+            bool sessOk = not rthOnly or mMkt.get(j) == 1
+            bool iBull  = isBull(iC)
+            bool iBear  = isBear(iC)
 
-        for lv in levels
-            float L = lv.price
-            if na(L)
-                continue
-            // Initial condition: price within nearPct of the level on this bar.
-            bool near = high >= L * (1 - nearPct) and low <= L * (1 + nearPct)
-            string tag = lv.kind + " " + str.tostring(L, format.mintick)
+            for lv in levels
+                float L = lv.price
+                if na(L)
+                    continue
+                // Initial condition: price within nearPct of the level on this bar.
+                bool near = iH >= L * (1 - nearPct) and iL <= L * (1 + nearPct)
+                string tag = lv.kind + " " + str.tostring(L, format.mintick)
 
-            // ===== Positive momentum ==========================================
-            if enMomUp
-                Trig s = lv.mu
-                if s.step > 0 and (close < L * (1 - resetPct) or s.expired())
-                    s.reset()
-                // 1. Price above the 20 EMA and the 5/10 EMA.
-                if s.step == 0 and near and bullTrend and sessOk
-                    s.step := 1
-                    s.t0   := time
-                // 2. Price passes through the level to the upside.
-                if s.step == 1 and pc <= L and close > L
-                    s.step := 2
-                // 3. Green 5m bar (may be the one containing the cross) that stays within
-                //    nearPct of the level on the wrong side and closes above it.
-                if s.step == 2 and not na(c5) and greenHold(c5, L)
-                    s.step    := 3
-                    s.ref     := c5.h
-                    s.stepBar := bar_index
-                // 4. A 2-minute bar closes above that 5-minute bar's high.
-                if s.step == 3 and not na(c2) and bar_index > s.stepBar and c2.c > s.ref and sessOk
-                    sigMU := true
-                    msg   += "Momentum UP at " + tag + "; "
-                    s.reset()
+                // ===== Positive momentum ==========================================
+                if enMomUp
+                    Trig s = lv.mu
+                    if s.step > 0 and (iC < L * (1 - resetPct) or s.expired(iT))
+                        s.reset()
+                    // 1. Price above the 20 EMA and the 5/10 EMA.
+                    if s.step == 0 and near and iBull and sessOk
+                        s.step := 1
+                        s.t0   := iT
+                    // 2. Price passes through the level to the upside.
+                    if s.step == 1 and iPC <= L and iC > L
+                        s.step := 2
+                    // 3. Green 5m bar (may be the one containing the cross) that stays within
+                    //    nearPct of the level on the wrong side and closes above it.
+                    if s.step == 2 and not na(c5) and greenHold(c5, L)
+                        s.step    := 3
+                        s.ref     := c5.h
+                        s.stepBar := ib
+                    // 4. A 2-minute bar closes above that 5-minute bar's high.
+                    if s.step == 3 and not na(c2) and ib > s.stepBar and c2.c > s.ref and sessOk
+                        sigMU := true
+                        msg   += "Momentum UP at " + tag + "; "
+                        s.reset()
 
-            // ===== Negative momentum ==========================================
-            if enMomDn
-                Trig s = lv.md
-                if s.step > 0 and (close > L * (1 + resetPct) or s.expired())
-                    s.reset()
-                // 1. Price below the 20 EMA and the 5/10 EMA.
-                if s.step == 0 and near and bearTrend and sessOk
-                    s.step := 1
-                    s.t0   := time
-                // 2. Price passes through the level to the downside.
-                if s.step == 1 and pc >= L and close < L
-                    s.step := 2
-                // 3. Red 5m bar (may be the one containing the cross) that stays within
-                //    nearPct of the level on the wrong side and closes below it.
-                if s.step == 2 and not na(c5) and redHold(c5, L)
-                    s.step    := 3
-                    s.ref     := c5.l
-                    s.stepBar := bar_index
-                // 4. A 2-minute bar closes below that 5-minute bar's low.
-                if s.step == 3 and not na(c2) and bar_index > s.stepBar and c2.c < s.ref and sessOk
-                    sigMD := true
-                    msg   += "Momentum DOWN at " + tag + "; "
-                    s.reset()
+                // ===== Negative momentum ==========================================
+                if enMomDn
+                    Trig s = lv.md
+                    if s.step > 0 and (iC > L * (1 + resetPct) or s.expired(iT))
+                        s.reset()
+                    // 1. Price below the 20 EMA and the 5/10 EMA.
+                    if s.step == 0 and near and iBear and sessOk
+                        s.step := 1
+                        s.t0   := iT
+                    // 2. Price passes through the level to the downside.
+                    if s.step == 1 and iPC >= L and iC < L
+                        s.step := 2
+                    // 3. Red 5m bar (may be the one containing the cross) that stays within
+                    //    nearPct of the level on the wrong side and closes below it.
+                    if s.step == 2 and not na(c5) and redHold(c5, L)
+                        s.step    := 3
+                        s.ref     := c5.l
+                        s.stepBar := ib
+                    // 4. A 2-minute bar closes below that 5-minute bar's low.
+                    if s.step == 3 and not na(c2) and ib > s.stepBar and c2.c < s.ref and sessOk
+                        sigMD := true
+                        msg   += "Momentum DOWN at " + tag + "; "
+                        s.reset()
 
-            // ===== Positive reversion =========================================
-            if enRevUp
-                Trig s = lv.ru
-                if s.step > 0 and (close < L * (1 - resetPct) or s.expired())
-                    s.reset()
-                if not na(c5) and sessOk
-                    // 1. Red 5m bar that tests the level and closes no more than nearPct below it.
-                    bool redTest = c5.c < c5.o and c5.l <= L * (1 + nearPct) and c5.c >= L * (1 - nearPct)
-                    if s.step == 0 and redTest
-                        s.step    := 1
-                        s.t0      := time
-                        s.stepBar := bar_index
-                    else if s.step == 1
-                        // 2. Green 5m bar that does not drop nearPct below the level and closes above it.
-                        if greenHold(c5, L)
-                            s.step    := 2
-                            s.ref     := c5.h
-                            s.stepBar := bar_index
-                        else if redTest
-                            s.t0      := time
-                            s.stepBar := bar_index
-                // 3. A 2-minute bar closes above that green 5m bar's high.
-                if s.step == 2 and not na(c2) and bar_index > s.stepBar and c2.c > s.ref and sessOk
-                    sigRU := true
-                    msg   += "Reversion UP at " + tag + "; "
-                    s.reset()
+                // ===== Positive reversion =========================================
+                if enRevUp
+                    Trig s = lv.ru
+                    if s.step > 0 and (iC < L * (1 - resetPct) or s.expired(iT))
+                        s.reset()
+                    if not na(c5) and sessOk
+                        // 1. Red 5m bar that tests the level and closes no more than nearPct below it.
+                        bool redTest = c5.c < c5.o and c5.l <= L * (1 + nearPct) and c5.c >= L * (1 - nearPct)
+                        if s.step == 0 and redTest
+                            s.step    := 1
+                            s.t0      := iT
+                            s.stepBar := ib
+                        else if s.step == 1
+                            // 2. Green 5m bar that does not drop nearPct below the level and closes above it.
+                            if greenHold(c5, L)
+                                s.step    := 2
+                                s.ref     := c5.h
+                                s.stepBar := ib
+                            else if redTest
+                                s.t0      := iT
+                                s.stepBar := ib
+                    // 3. A 2-minute bar closes above that green 5m bar's high.
+                    if s.step == 2 and not na(c2) and ib > s.stepBar and c2.c > s.ref and sessOk
+                        sigRU := true
+                        msg   += "Reversion UP at " + tag + "; "
+                        s.reset()
 
-            // ===== Negative reversion =========================================
-            if enRevDn
-                Trig s = lv.rd
-                if s.step > 0 and (close > L * (1 + resetPct) or s.expired())
-                    s.reset()
-                if not na(c5) and sessOk
-                    // 1. Green 5m bar that tests the level and closes no more than nearPct above it.
-                    bool greenTest = c5.c > c5.o and c5.h >= L * (1 - nearPct) and c5.c <= L * (1 + nearPct)
-                    if s.step == 0 and greenTest
-                        s.step    := 1
-                        s.t0      := time
-                        s.stepBar := bar_index
-                    else if s.step == 1
-                        // 2. Red 5m bar that does not rise nearPct above the level and closes below it.
-                        if redHold(c5, L)
-                            s.step    := 2
-                            s.ref     := c5.l
-                            s.stepBar := bar_index
-                        else if greenTest
-                            s.t0      := time
-                            s.stepBar := bar_index
-                // 3. A 2-minute bar closes below that red 5m bar's low.
-                if s.step == 2 and not na(c2) and bar_index > s.stepBar and c2.c < s.ref and sessOk
-                    sigRD := true
-                    msg   += "Reversion DOWN at " + tag + "; "
-                    s.reset()
+                // ===== Negative reversion =========================================
+                if enRevDn
+                    Trig s = lv.rd
+                    if s.step > 0 and (iC > L * (1 + resetPct) or s.expired(iT))
+                        s.reset()
+                    if not na(c5) and sessOk
+                        // 1. Green 5m bar that tests the level and closes no more than nearPct above it.
+                        bool greenTest = c5.c > c5.o and c5.h >= L * (1 - nearPct) and c5.c <= L * (1 + nearPct)
+                        if s.step == 0 and greenTest
+                            s.step    := 1
+                            s.t0      := iT
+                            s.stepBar := ib
+                        else if s.step == 1
+                            // 2. Red 5m bar that does not rise nearPct above the level and closes below it.
+                            if redHold(c5, L)
+                                s.step    := 2
+                                s.ref     := c5.l
+                                s.stepBar := ib
+                            else if greenTest
+                                s.t0      := iT
+                                s.stepBar := ib
+                    // 3. A 2-minute bar closes below that red 5m bar's low.
+                    if s.step == 2 and not na(c2) and ib > s.stepBar and c2.c < s.ref and sessOk
+                        sigRD := true
+                        msg   += "Reversion DOWN at " + tag + "; "
+                        s.reset()
 
         if msg != ""
             alert(syminfo.ticker + ": " + msg, alert.freq_once_per_bar_close)
@@ -476,5 +513,5 @@ if barstate.islast
     for lv in levels
         if not na(lv.lb)
             label.set_x(lv.lb, bar_index + 3)
-    table.cell(info, 0, 0, trigTf ? "" : "Triggers run on a 1-minute chart only", text_color = color.orange, text_size = size.small)
+    table.cell(info, 0, 0, trigTf ? "" : "Triggers run on 1- to 15-minute charts only", text_color = color.orange, text_size = size.small)
     table.cell(info, 0, 1, sawPremarket ? "" : "No pre-market data: enable extended hours", text_color = color.orange, text_size = size.small)
