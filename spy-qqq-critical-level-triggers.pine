@@ -1,0 +1,530 @@
+//@version=6
+indicator("SPY/QQQ Critical Level Triggers", shorttitle = "Crit Lvl Triggers", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+// =============================================================================
+// Implements "SPY and QQQ trading algo instructions":
+//   - Critical levels: prior-day H/L/O/C, today's pre-market H/L, 1H pivot
+//     highs/lows from the past N trading days, and VWAP (updated every minute).
+//   - 1H 20 EMA, 1H 5/10 EMA cloud (orange), 1H 35/50 EMA cloud (light blue),
+//     VWAP with bands.
+//   - Four sequential triggers evaluated per critical level:
+//       Momentum up   (green triangle up)     Momentum down  (red triangle down)
+//       Reversion up  (green circle)          Reversion down (red circle)
+//
+// Triggers are always evaluated on 1-minute bars, so the result is the same on
+// any chart from 1 to 15 minutes. On charts above 1 minute the 1-minute bars
+// are requested with request.security_lower_tf() and replayed inside each
+// chart bar; a trigger is marked on the chart bar that contains it. 5-minute
+// and 2-minute bars are aggregated from the 1-minute bars. Enable extended
+// hours on the chart so pre-market levels can be collected.
+// All trigger logic runs on confirmed (closed) chart bars only, so it does not
+// repaint. On a higher-timeframe chart a realtime trigger therefore appears
+// when the chart bar closes.
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// Inputs
+// ---------------------------------------------------------------------------
+grpLvl = "Critical Levels"
+inclExtHL  = input.bool(true, "Prior-day high/low includes pre/post market", group = grpLvl)
+pivLeft    = input.int(6, "Pivot left bars (1H)", minval = 1, group = grpLvl)
+pivRight   = input.int(6, "Pivot right bars (1H)", minval = 1, group = grpLvl)
+lookDays   = input.int(10, "Pivot lookback (trading days)", minval = 1, maxval = 30, group = grpLvl)
+mergePct   = input.float(0.05, "Skip pivots within % of an existing level", minval = 0, step = 0.01, group = grpLvl) / 100
+pdColor    = input.color(color.rgb(135, 206, 250), "Prior-day level color", group = grpLvl)
+pmColor    = input.color(color.yellow, "Pre-market level color", group = grpLvl)
+pivColor   = input.color(color.purple, "Pivot level color", group = grpLvl)
+showLabels = input.bool(true, "Show level labels", group = grpLvl)
+vwapLevel  = input.bool(true, "Use VWAP as a critical level", group = grpLvl)
+
+grpInd = "Indicators"
+showEma   = input.bool(true, "Show 1H EMAs / clouds", group = grpInd)
+ema20Col  = input.color(color.fuchsia, "20 EMA color", group = grpInd)
+showVwap  = input.bool(true, "Show VWAP with bands", group = grpInd)
+bandMult1 = input.float(1.0, "VWAP band #1 (stdev)", step = 0.5, group = grpInd)
+bandMult2 = input.float(2.0, "VWAP band #2 (stdev)", step = 0.5, group = grpInd)
+
+grpTr = "Triggers"
+nearPct   = input.float(0.10, "Proximity to a critical level (%)", minval = 0, step = 0.01, group = grpTr) / 100
+resetPct  = input.float(0.15, "Reset distance beyond the level (%)", minval = 0, step = 0.01, group = grpTr) / 100
+expiryMin = input.int(60, "Setup expiry (minutes, 0 = never)", minval = 0, group = grpTr)
+rthOnly   = input.bool(true, "Signals only during regular session", group = grpTr)
+enMomUp   = input.bool(true, "Positive momentum trigger", group = grpTr)
+enMomDn   = input.bool(true, "Negative momentum trigger", group = grpTr)
+enRevUp   = input.bool(true, "Positive reversion trigger", group = grpTr)
+enRevDn   = input.bool(true, "Negative reversion trigger", group = grpTr)
+
+if not timeframe.isintraday
+    runtime.error("Use an intraday chart. Triggers require a 1- to 15-minute chart.")
+
+bool trigTf = timeframe.isminutes and timeframe.multiplier <= 15
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+// An aggregated higher-timeframe bar (5m / 2m) built from chart bars.
+type Bucket
+    int   t
+    float o
+    float h
+    float l
+    float c
+    bool  closed = false
+
+// Per-level state for one trigger.
+type Trig
+    int   step = 0
+    float ref
+    int   t0
+    int   stepBar
+
+type Level
+    float  price
+    string kind
+    int    t
+    line   ln
+    label  lb
+    bool   daily = false
+    bool   seen  = false
+    Trig   mu
+    Trig   md
+    Trig   ru
+    Trig   rd
+
+method reset(Trig this) =>
+    this.step      := 0
+    this.ref       := na
+    this.t0        := na
+    this.stepBar   := na
+
+method expired(Trig this, int now) =>
+    expiryMin > 0 and not na(this.t0) and now - this.t0 > expiryMin * 60000
+
+// ---------------------------------------------------------------------------
+// 1H EMAs (live, non-repainting): last confirmed 1H EMA advanced by the
+// current price, which equals the value the 1H chart shows intrabar.
+// ---------------------------------------------------------------------------
+htfPrevEma(simple int len) =>
+    request.security(syminfo.tickerid, "60", ta.ema(close, len)[1], lookahead = barmerge.lookahead_on)
+
+liveEma(float prev, int len, float c) =>
+    na(prev) ? na : prev + 2.0 / (len + 1) * (c - prev)
+
+float pe5  = htfPrevEma(5)
+float pe10 = htfPrevEma(10)
+float pe20 = htfPrevEma(20)
+float pe35 = htfPrevEma(35)
+float pe50 = htfPrevEma(50)
+
+float ema5  = liveEma(pe5,  5,  close)
+float ema10 = liveEma(pe10, 10, close)
+float ema20 = liveEma(pe20, 20, close)
+float ema35 = liveEma(pe35, 35, close)
+float ema50 = liveEma(pe50, 50, close)
+
+// Trend filters evaluated at price `c` (a 1-minute close inside the chart bar).
+isBull(float c) => c > liveEma(pe20, 20, c) and c > math.max(liveEma(pe5, 5, c), liveEma(pe10, 10, c))
+isBear(float c) => c < liveEma(pe20, 20, c) and c < math.min(liveEma(pe5, 5, c), liveEma(pe10, 10, c))
+
+// ---------------------------------------------------------------------------
+// 1-minute bars inside each chart bar (a single element on a 1-minute chart).
+// ---------------------------------------------------------------------------
+string ltfTf = trigTf ? "1" : timeframe.period
+[mT, mTC, mO, mH, mL, mC, mMkt, mVwap] = request.security_lower_tf(syminfo.tickerid, ltfTf, [time, time_close, open, high, low, close, session.ismarket ? 1 : 0, ta.vwap(hlc3, timeframe.change("D"))])
+
+// ---------------------------------------------------------------------------
+// VWAP with bands (anchored to each trading day)
+// ---------------------------------------------------------------------------
+bool newDay = timeframe.change("D")
+[vwapVal, vUp1, vLo1] = ta.vwap(hlc3, newDay, bandMult1)
+[vwap2, vUp2, vLo2] = ta.vwap(hlc3, newDay, bandMult2)
+
+// ---------------------------------------------------------------------------
+// 1H pivots from the past N trading days, computed on 1H data so the lookback
+// does not depend on how many 1-minute bars the chart has loaded.
+// Up to 8 most recent pivot highs and 8 most recent pivot lows are returned.
+// ---------------------------------------------------------------------------
+pv(bool cond, float src, int tsrc, simple int k) =>
+    [ta.valuewhen(cond, src, k)[1], ta.valuewhen(cond, tsrc, k)[1]]
+
+pivData() =>
+    float ph = ta.pivothigh(high, pivLeft, pivRight)
+    float pl = ta.pivotlow(low, pivLeft, pivRight)
+    int   pt = time[pivRight]
+    bool  hc = not na(ph)
+    bool  lc = not na(pl)
+    [h0, ht0] = pv(hc, ph, pt, 0)
+    [h1, ht1] = pv(hc, ph, pt, 1)
+    [h2, ht2] = pv(hc, ph, pt, 2)
+    [h3, ht3] = pv(hc, ph, pt, 3)
+    [h4, ht4] = pv(hc, ph, pt, 4)
+    [h5, ht5] = pv(hc, ph, pt, 5)
+    [h6, ht6] = pv(hc, ph, pt, 6)
+    [h7, ht7] = pv(hc, ph, pt, 7)
+    [l0, lt0] = pv(lc, pl, pt, 0)
+    [l1, lt1] = pv(lc, pl, pt, 1)
+    [l2, lt2] = pv(lc, pl, pt, 2)
+    [l3, lt3] = pv(lc, pl, pt, 3)
+    [l4, lt4] = pv(lc, pl, pt, 4)
+    [l5, lt5] = pv(lc, pl, pt, 5)
+    [l6, lt6] = pv(lc, pl, pt, 6)
+    [l7, lt7] = pv(lc, pl, pt, 7)
+    // Start of the trading day `lookDays` days before today.
+    int cut = ta.valuewhen(timeframe.change("D"), time, lookDays)[1]
+    [h0, ht0, h1, ht1, h2, ht2, h3, ht3, h4, ht4, h5, ht5, h6, ht6, h7, ht7, l0, lt0, l1, lt1, l2, lt2, l3, lt3, l4, lt4, l5, lt5, l6, lt6, l7, lt7, cut]
+
+[h0, ht0, h1, ht1, h2, ht2, h3, ht3, h4, ht4, h5, ht5, h6, ht6, h7, ht7, l0, lt0, l1, lt1, l2, lt2, l3, lt3, l4, lt4, l5, lt5, l6, lt6, l7, lt7, pivCut] = request.security(syminfo.tickerid, "60", pivData(), lookahead = barmerge.lookahead_on)
+
+bool pivChanged = nz(ht0) != nz(ht0[1]) or nz(lt0) != nz(lt0[1]) or nz(pivCut) != nz(pivCut[1])
+
+// ---------------------------------------------------------------------------
+// Level storage / drawing helpers
+// ---------------------------------------------------------------------------
+var array<Level> levels = array.new<Level>()
+
+newLevel(float p, string kind, int t, int width, string style, color col, bool daily) =>
+    line ln = line.new(t, p, t + 60000, p, xloc = xloc.bar_time, extend = extend.right, color = col, style = style, width = width)
+    label lb = showLabels ? label.new(bar_index, p, kind + " " + str.tostring(p, format.mintick), style = label.style_label_left, color = color(na), textcolor = col, size = size.small) : na
+    Level.new(price = p, kind = kind, t = t, ln = ln, lb = lb, daily = daily, seen = true, mu = Trig.new(), md = Trig.new(), ru = Trig.new(), rd = Trig.new())
+
+method setPrice(Level this, float p) =>
+    this.price := p
+    line.set_y1(this.ln, p)
+    line.set_y2(this.ln, p)
+    if not na(this.lb)
+        label.set_y(this.lb, p)
+        label.set_text(this.lb, this.kind + " " + str.tostring(p, format.mintick))
+
+// Removes daily levels (daily = true) or pivot levels that were not seen in
+// the latest pivot refresh (daily = false).
+purge(bool daily) =>
+    int i = levels.size() - 1
+    while i >= 0
+        Level lv = levels.get(i)
+        if lv.kind != "VWAP" and lv.daily == daily and (daily or not lv.seen)
+            line.delete(lv.ln)
+            label.delete(lv.lb)
+            levels.remove(i)
+        i -= 1
+
+nearExisting(float p) =>
+    bool found = false
+    for lv in levels
+        if lv.kind != "VWAP" and math.abs(lv.price - p) <= p * mergePct
+            found := true
+            break
+    found
+
+// Aggregates 1-minute bars into a bucket of `periodMs`. Returns a copy of the
+// bucket on the 1-minute bar where it completes, otherwise na.
+updBucket(Bucket b, int periodMs, int t, int tc, float o, float h, float l, float c) =>
+    Bucket done = na
+    int start = t - t % periodMs
+    if na(b.t) or start != b.t
+        // Previous bucket ended without a boundary bar (data gap): complete it now.
+        if not na(b.t) and not b.closed
+            done := b.copy()
+        b.t      := start
+        b.o      := o
+        b.h      := h
+        b.l      := l
+        b.c      := c
+        b.closed := false
+    else
+        b.h    := math.max(b.h, h)
+        b.l    := math.min(b.l, l)
+        b.c    := c
+    if tc % periodMs == 0
+        b.closed := true
+        done     := b.copy()
+    done
+
+// Green 5m bar that does not drop more than nearPct below the level and closes above it.
+greenHold(Bucket b, float lvl) => b.c > b.o and b.l >= lvl * (1 - nearPct) and b.c > lvl
+// Red 5m bar that does not rise more than nearPct above the level and closes below it.
+redHold(Bucket b, float lvl) => b.c < b.o and b.h <= lvl * (1 + nearPct) and b.c < lvl
+
+// ---------------------------------------------------------------------------
+// Daily tracking: prior-day H/L/O/C and today's pre-market H/L
+// ---------------------------------------------------------------------------
+var float dHi    = na
+var float dLo    = na
+var float rOpen  = na
+var float rClose = na
+var Level pmHiLv = na
+var Level pmLoLv = na
+var bool  sawPremarket = false
+
+var Bucket b5 = Bucket.new()
+var Bucket b2 = Bucket.new()
+
+// VWAP critical level: no line of its own (VWAP is plotted); price is set from
+// the 1-minute VWAP once per minute.
+var Level vwapLv = na
+if vwapLevel and na(vwapLv)
+    vwapLv := Level.new(price = na, kind = "VWAP", t = na, ln = na, lb = na, daily = false, seen = true, mu = Trig.new(), md = Trig.new(), ru = Trig.new(), rd = Trig.new())
+    levels.push(vwapLv)
+
+var int   ib     = 0    // running count of processed 1-minute bars
+var float lastC  = na   // previous 1-minute close
+
+bool sigMU = false
+bool sigMD = false
+bool sigRU = false
+bool sigRD = false
+string msg = ""
+
+if barstate.isconfirmed
+    // --- New trading day: roll prior-day levels -----------------------------
+    if newDay
+        purge(true)
+        pmHiLv := na
+        pmLoLv := na
+        if not na(rOpen) and not na(dHi)
+            int t = time
+            levels.push(newLevel(dHi,    "PDH", t, 1, line.style_solid, pdColor, true))
+            levels.push(newLevel(dLo,    "PDL", t, 1, line.style_solid, pdColor, true))
+            levels.push(newLevel(rOpen,  "PDO", t, 1, line.style_solid, pdColor, true))
+            levels.push(newLevel(rClose, "PDC", t, 1, line.style_solid, pdColor, true))
+        for lv in levels
+            lv.mu.reset()
+            lv.md.reset()
+            lv.ru.reset()
+            lv.rd.reset()
+        dHi    := na
+        dLo    := na
+        rOpen  := na
+        rClose := na
+
+    bool mkt = session.ismarket
+    if inclExtHL or mkt
+        dHi := na(dHi) ? high : math.max(dHi, high)
+        dLo := na(dLo) ? low  : math.min(dLo, low)
+    if mkt
+        if na(rOpen)
+            rOpen := open
+        rClose := close
+
+    // --- Pre-market high / low (developing until the open) -------------------
+    if session.ispremarket
+        sawPremarket := true
+        if na(pmHiLv)
+            pmHiLv := newLevel(high, "PMH", time, 1, line.style_solid, pmColor, true)
+            pmLoLv := newLevel(low,  "PML", time, 1, line.style_solid, pmColor, true)
+            levels.push(pmHiLv)
+            levels.push(pmLoLv)
+        else
+            if high > pmHiLv.price
+                pmHiLv.setPrice(high)
+            if low < pmLoLv.price
+                pmLoLv.setPrice(low)
+
+    // --- Refresh 1H pivot levels --------------------------------------------
+    if pivChanged
+        array<float> pvs = array.from(h0, h1, h2, h3, h4, h5, h6, h7, l0, l1, l2, l3, l4, l5, l6, l7)
+        array<int>   pts = array.from(ht0, ht1, ht2, ht3, ht4, ht5, ht6, ht7, lt0, lt1, lt2, lt3, lt4, lt5, lt6, lt7)
+        for lv in levels
+            if not lv.daily
+                lv.seen := false
+        for i = 0 to 15
+            float v = pvs.get(i)
+            int   t = pts.get(i)
+            if na(v) or na(t) or (not na(pivCut) and t < pivCut)
+                continue
+            string k = i < 8 ? "PH" : "PL"
+            Level found = na
+            for lv in levels
+                if not lv.daily and lv.t == t and lv.kind == k
+                    found := lv
+                    break
+            if not na(found)
+                found.seen := true
+            else if not nearExisting(v)
+                levels.push(newLevel(v, k, t, 1, line.style_dashed, pivColor, false))
+        purge(false)
+
+    // --- Triggers ------------------------------------------------------------
+    if trigTf
+        int nIntra = mC.size()
+        // `for j = 0 to -1` would run once, so skip empty chart bars explicitly.
+        for j = 0 to nIntra - 1
+            if nIntra == 0
+                break
+            int   iT  = mT.get(j)
+            int   iTC = mTC.get(j)
+            float iO  = mO.get(j)
+            float iH  = mH.get(j)
+            float iL  = mL.get(j)
+            float iC  = mC.get(j)
+            float iPC = lastC
+            lastC  := iC
+            ib     += 1
+            Bucket c5 = updBucket(b5, 300000, iT, iTC, iO, iH, iL, iC)
+            Bucket c2 = updBucket(b2, 120000, iT, iTC, iO, iH, iL, iC)
+            bool sessOk = not rthOnly or mMkt.get(j) == 1
+            bool iBull  = isBull(iC)
+            bool iBear  = isBear(iC)
+            float iVwap = mVwap.get(j)
+            if not na(vwapLv)
+                vwapLv.price := iVwap
+
+            for lv in levels
+                float L = lv.price
+                if na(L)
+                    continue
+                // Initial condition: price within nearPct of the level on this bar.
+                bool near = iH >= L * (1 - nearPct) and iL <= L * (1 + nearPct)
+                string tag = lv.kind + " " + str.tostring(L, format.mintick)
+
+                // ===== Positive momentum ==========================================
+                if enMomUp
+                    Trig s = lv.mu
+                    if s.step > 0 and (iC < L * (1 - resetPct) or s.expired(iT))
+                        s.reset()
+                    // 1. Price above the 20 EMA and the 5/10 EMA.
+                    if s.step == 0 and near and iBull and sessOk
+                        s.step := 1
+                        s.t0   := iT
+                    // 2. Price passes through the level to the upside.
+                    if s.step == 1 and iPC <= L and iC > L
+                        s.step := 2
+                    // 3. Green 5m bar (may be the one containing the cross) that stays within
+                    //    nearPct of the level on the wrong side and closes above it.
+                    if s.step == 2 and not na(c5) and greenHold(c5, L)
+                        s.step    := 3
+                        s.ref     := c5.h
+                        s.stepBar := ib
+                    // 4. A 2-minute bar closes above that 5-minute bar's high.
+                    if s.step == 3 and not na(c2) and ib > s.stepBar and c2.c > s.ref and sessOk
+                        sigMU := true
+                        msg   += "Momentum UP at " + tag + "; "
+                        s.reset()
+
+                // ===== Negative momentum ==========================================
+                if enMomDn
+                    Trig s = lv.md
+                    if s.step > 0 and (iC > L * (1 + resetPct) or s.expired(iT))
+                        s.reset()
+                    // 1. Price below the 20 EMA and the 5/10 EMA.
+                    if s.step == 0 and near and iBear and sessOk
+                        s.step := 1
+                        s.t0   := iT
+                    // 2. Price passes through the level to the downside.
+                    if s.step == 1 and iPC >= L and iC < L
+                        s.step := 2
+                    // 3. Red 5m bar (may be the one containing the cross) that stays within
+                    //    nearPct of the level on the wrong side and closes below it.
+                    if s.step == 2 and not na(c5) and redHold(c5, L)
+                        s.step    := 3
+                        s.ref     := c5.l
+                        s.stepBar := ib
+                    // 4. A 2-minute bar closes below that 5-minute bar's low.
+                    if s.step == 3 and not na(c2) and ib > s.stepBar and c2.c < s.ref and sessOk
+                        sigMD := true
+                        msg   += "Momentum DOWN at " + tag + "; "
+                        s.reset()
+
+                // ===== Positive reversion =========================================
+                if enRevUp
+                    Trig s = lv.ru
+                    if s.step > 0 and (iC < L * (1 - resetPct) or s.expired(iT))
+                        s.reset()
+                    if not na(c5) and sessOk
+                        // 1. Red 5m bar that tests the level and closes no more than nearPct below it.
+                        bool redTest = c5.c < c5.o and c5.l <= L * (1 + nearPct) and c5.c >= L * (1 - nearPct)
+                        // 0. Price must be below VWAP.
+                        if s.step == 0 and redTest and iC < iVwap
+                            s.step    := 1
+                            s.t0      := iT
+                            s.stepBar := ib
+                        else if s.step == 1
+                            // 2. Green 5m bar that does not drop nearPct below the level and closes above it.
+                            if greenHold(c5, L)
+                                s.step    := 2
+                                s.ref     := c5.h
+                                s.stepBar := ib
+                            else if redTest
+                                s.t0      := iT
+                                s.stepBar := ib
+                    // 3. A 2-minute bar closes above that green 5m bar's high.
+                    if s.step == 2 and not na(c2) and ib > s.stepBar and c2.c > s.ref and sessOk
+                        sigRU := true
+                        msg   += "Reversion UP at " + tag + "; "
+                        s.reset()
+
+                // ===== Negative reversion =========================================
+                if enRevDn
+                    Trig s = lv.rd
+                    if s.step > 0 and (iC > L * (1 + resetPct) or s.expired(iT))
+                        s.reset()
+                    if not na(c5) and sessOk
+                        // 1. Green 5m bar that tests the level and closes no more than nearPct above it.
+                        bool greenTest = c5.c > c5.o and c5.h >= L * (1 - nearPct) and c5.c <= L * (1 + nearPct)
+                        // 0. Price must be above VWAP.
+                        if s.step == 0 and greenTest and iC > iVwap
+                            s.step    := 1
+                            s.t0      := iT
+                            s.stepBar := ib
+                        else if s.step == 1
+                            // 2. Red 5m bar that does not rise nearPct above the level and closes below it.
+                            if redHold(c5, L)
+                                s.step    := 2
+                                s.ref     := c5.l
+                                s.stepBar := ib
+                            else if greenTest
+                                s.t0      := iT
+                                s.stepBar := ib
+                    // 3. A 2-minute bar closes below that red 5m bar's low.
+                    if s.step == 2 and not na(c2) and ib > s.stepBar and c2.c < s.ref and sessOk
+                        sigRD := true
+                        msg   += "Reversion DOWN at " + tag + "; "
+                        s.reset()
+
+        if msg != ""
+            alert(syminfo.ticker + ": " + msg, alert.freq_once_per_bar_close)
+
+// ---------------------------------------------------------------------------
+// Plots: EMAs / clouds / VWAP
+// ---------------------------------------------------------------------------
+color lightBlue = color.rgb(135, 206, 250)
+
+p5  = plot(showEma ? ema5  : na, "1H EMA 5",  color = color.orange)
+p10 = plot(showEma ? ema10 : na, "1H EMA 10", color = color.orange)
+fill(p5, p10, color = color.new(color.orange, 75), title = "1H 5/10 EMA cloud")
+
+p35 = plot(showEma ? ema35 : na, "1H EMA 35", color = lightBlue)
+p50 = plot(showEma ? ema50 : na, "1H EMA 50", color = lightBlue)
+fill(p35, p50, color = color.new(lightBlue, 75), title = "1H 35/50 EMA cloud")
+
+plot(showEma ? ema20 : na, "1H EMA 20", color = ema20Col, linewidth = 2)
+
+plot(showVwap ? vwapVal : na, "VWAP", color = color.aqua, linewidth = 2)
+pU1 = plot(showVwap ? vUp1 : na, "VWAP upper band #1", color = color.new(color.aqua, 40))
+pL1 = plot(showVwap ? vLo1 : na, "VWAP lower band #1", color = color.new(color.aqua, 40))
+pU2 = plot(showVwap ? vUp2 : na, "VWAP upper band #2", color = color.new(color.aqua, 60))
+pL2 = plot(showVwap ? vLo2 : na, "VWAP lower band #2", color = color.new(color.aqua, 60))
+fill(pU1, pL1, color = color.new(color.aqua, 92), title = "VWAP band #1 fill")
+
+// ---------------------------------------------------------------------------
+// Trigger markers
+// ---------------------------------------------------------------------------
+plotshape(sigMU, "Positive momentum trigger", shape.triangleup,   location.belowbar, color.green, size = size.small)
+plotshape(sigMD, "Negative momentum trigger", shape.triangledown, location.abovebar, color.red,   size = size.small)
+plotshape(sigRU, "Positive reversion trigger", shape.circle,      location.belowbar, color.green, size = size.small)
+plotshape(sigRD, "Negative reversion trigger", shape.circle,      location.abovebar, color.red,   size = size.small)
+
+alertcondition(sigMU, "Positive momentum trigger",  "{{ticker}}: positive momentum trigger at a critical level")
+alertcondition(sigMD, "Negative momentum trigger",  "{{ticker}}: negative momentum trigger at a critical level")
+alertcondition(sigRU, "Positive reversion trigger", "{{ticker}}: positive reversion trigger at a critical level")
+alertcondition(sigRD, "Negative reversion trigger", "{{ticker}}: negative reversion trigger at a critical level")
+
+// ---------------------------------------------------------------------------
+// Level labels and chart warnings
+// ---------------------------------------------------------------------------
+var table info = table.new(position.bottom_right, 1, 2)
+if barstate.islast
+    for lv in levels
+        if not na(lv.lb)
+            label.set_x(lv.lb, bar_index + 3)
+    table.cell(info, 0, 0, trigTf ? "" : "Triggers run on 1- to 15-minute charts only", text_color = color.orange, text_size = size.small)
+    table.cell(info, 0, 1, sawPremarket ? "" : "No pre-market data: enable extended hours", text_color = color.orange, text_size = size.small)
