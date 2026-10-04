@@ -3,13 +3,13 @@ indicator("SPY/QQQ Critical Level Triggers", shorttitle = "Crit Lvl Triggers", o
 
 // =============================================================================
 // Implements "SPY and QQQ trading algo instructions":
-//   - Critical levels: prior-day H/L/O/C, today's pre-market H/L, and 1H pivot
-//     highs/lows from the past N trading days.
+//   - Critical levels: prior-day H/L/O/C, today's pre-market H/L, 1H pivot
+//     highs/lows from the past N trading days, and VWAP (updated every minute).
 //   - 1H 20 EMA, 1H 5/10 EMA cloud (orange), 1H 35/50 EMA cloud (light blue),
 //     VWAP with bands.
 //   - Four sequential triggers evaluated per critical level:
 //       Momentum up   (green triangle up)     Momentum down  (red triangle down)
-//       Reversion up  (green arrow up)        Reversion down (red arrow down)
+//       Reversion up  (green circle)          Reversion down (red circle)
 //
 // Triggers are always evaluated on 1-minute bars, so the result is the same on
 // any chart from 1 to 15 minutes. On charts above 1 minute the 1-minute bars
@@ -35,6 +35,7 @@ pdColor    = input.color(color.rgb(135, 206, 250), "Prior-day level color", grou
 pmColor    = input.color(color.yellow, "Pre-market level color", group = grpLvl)
 pivColor   = input.color(color.purple, "Pivot level color", group = grpLvl)
 showLabels = input.bool(true, "Show level labels", group = grpLvl)
+vwapLevel  = input.bool(true, "Use VWAP as a critical level", group = grpLvl)
 
 grpInd = "Indicators"
 showEma   = input.bool(true, "Show 1H EMAs / clouds", group = grpInd)
@@ -129,7 +130,7 @@ isBear(float c) => c < liveEma(pe20, 20, c) and c < math.min(liveEma(pe5, 5, c),
 // 1-minute bars inside each chart bar (a single element on a 1-minute chart).
 // ---------------------------------------------------------------------------
 string ltfTf = trigTf ? "1" : timeframe.period
-[mT, mTC, mO, mH, mL, mC, mMkt] = request.security_lower_tf(syminfo.tickerid, ltfTf, [time, time_close, open, high, low, close, session.ismarket ? 1 : 0])
+[mT, mTC, mO, mH, mL, mC, mMkt, mVwap] = request.security_lower_tf(syminfo.tickerid, ltfTf, [time, time_close, open, high, low, close, session.ismarket ? 1 : 0, ta.vwap(hlc3, timeframe.change("D"))])
 
 // ---------------------------------------------------------------------------
 // VWAP with bands (anchored to each trading day)
@@ -200,7 +201,7 @@ purge(bool daily) =>
     int i = levels.size() - 1
     while i >= 0
         Level lv = levels.get(i)
-        if lv.daily == daily and (daily or not lv.seen)
+        if lv.kind != "VWAP" and lv.daily == daily and (daily or not lv.seen)
             line.delete(lv.ln)
             label.delete(lv.lb)
             levels.remove(i)
@@ -209,7 +210,7 @@ purge(bool daily) =>
 nearExisting(float p) =>
     bool found = false
     for lv in levels
-        if math.abs(lv.price - p) <= p * mergePct
+        if lv.kind != "VWAP" and math.abs(lv.price - p) <= p * mergePct
             found := true
             break
     found
@@ -256,6 +257,13 @@ var bool  sawPremarket = false
 
 var Bucket b5 = Bucket.new()
 var Bucket b2 = Bucket.new()
+
+// VWAP critical level: no line of its own (VWAP is plotted); price is set from
+// the 1-minute VWAP once per minute.
+var Level vwapLv = na
+if vwapLevel and na(vwapLv)
+    vwapLv := Level.new(price = na, kind = "VWAP", t = na, ln = na, lb = na, daily = false, seen = true, mu = Trig.new(), md = Trig.new(), ru = Trig.new(), rd = Trig.new())
+    levels.push(vwapLv)
 
 var int   ib     = 0    // running count of processed 1-minute bars
 var float lastC  = na   // previous 1-minute close
@@ -356,6 +364,9 @@ if barstate.isconfirmed
             bool sessOk = not rthOnly or mMkt.get(j) == 1
             bool iBull  = isBull(iC)
             bool iBear  = isBear(iC)
+            float iVwap = mVwap.get(j)
+            if not na(vwapLv)
+                vwapLv.price := iVwap
 
             for lv in levels
                 float L = lv.price
@@ -421,7 +432,8 @@ if barstate.isconfirmed
                     if not na(c5) and sessOk
                         // 1. Red 5m bar that tests the level and closes no more than nearPct below it.
                         bool redTest = c5.c < c5.o and c5.l <= L * (1 + nearPct) and c5.c >= L * (1 - nearPct)
-                        if s.step == 0 and redTest
+                        // 0. Price must be below VWAP.
+                        if s.step == 0 and redTest and iC < iVwap
                             s.step    := 1
                             s.t0      := iT
                             s.stepBar := ib
@@ -448,7 +460,8 @@ if barstate.isconfirmed
                     if not na(c5) and sessOk
                         // 1. Green 5m bar that tests the level and closes no more than nearPct above it.
                         bool greenTest = c5.c > c5.o and c5.h >= L * (1 - nearPct) and c5.c <= L * (1 + nearPct)
-                        if s.step == 0 and greenTest
+                        // 0. Price must be above VWAP.
+                        if s.step == 0 and greenTest and iC > iVwap
                             s.step    := 1
                             s.t0      := iT
                             s.stepBar := ib
@@ -497,8 +510,8 @@ fill(pU1, pL1, color = color.new(color.aqua, 92), title = "VWAP band #1 fill")
 // ---------------------------------------------------------------------------
 plotshape(sigMU, "Positive momentum trigger", shape.triangleup,   location.belowbar, color.green, size = size.small)
 plotshape(sigMD, "Negative momentum trigger", shape.triangledown, location.abovebar, color.red,   size = size.small)
-plotshape(sigRU, "Positive reversion trigger", shape.arrowup,     location.belowbar, color.green, size = size.normal)
-plotshape(sigRD, "Negative reversion trigger", shape.arrowdown,   location.abovebar, color.red,   size = size.normal)
+plotshape(sigRU, "Positive reversion trigger", shape.circle,      location.belowbar, color.green, size = size.small)
+plotshape(sigRD, "Negative reversion trigger", shape.circle,      location.abovebar, color.red,   size = size.small)
 
 alertcondition(sigMU, "Positive momentum trigger",  "{{ticker}}: positive momentum trigger at a critical level")
 alertcondition(sigMD, "Negative momentum trigger",  "{{ticker}}: negative momentum trigger at a critical level")
